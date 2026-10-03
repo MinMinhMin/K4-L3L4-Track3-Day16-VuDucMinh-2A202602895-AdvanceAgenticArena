@@ -79,16 +79,60 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        if not isinstance(report, dict):
+            return {}
+        claims = report.get("claims")
+        if not isinstance(claims, list):
+            return report
+
+        docs = getattr(ctx.corpus, "docs", ()) if ctx.corpus is not None else ()
+
+        def sources_for(text):
+            if not text or not ctx.saw(text):
+                return []
+            for doc in docs:
+                if doc.body in ctx.observed_text and any(
+                    text in line for line in doc.body.splitlines()
+                ):
+                    yield doc.doc_id
+
+        retained = []
+        for claim in claims:
+            if not isinstance(claim, dict) or not isinstance(claim.get("text"), str):
+                continue
+            text = claim["text"]
+            if ctx.saw(text):
+                retained.append(claim)
+                continue
+            separator = " và "
+            start = 0
+            while True:
+                split_at = text.find(separator, start)
+                if split_at == -1:
+                    break
+                left = text[:split_at]
+                right = text[split_at + len(separator):]
+                split_sources = next(
+                    ((left_doc, right_doc)
+                     for left_doc in sources_for(left)
+                     for right_doc in sources_for(right)
+                     if left_doc != right_doc),
+                    None,
+                )
+                if split_sources is not None:
+                    left_doc, right_doc = split_sources
+                    retained.extend(
+                        ({**claim, "text": left, "doc_id": left_doc},
+                         {**claim, "text": right, "doc_id": right_doc})
+                    )
+                    report["abstain"] = True
+                    break
+                start = split_at + len(separator)
+        report["claims"] = retained
+        if not retained:
+            report["abstain"] = True
+            report["answer"] = "Không đủ căn cứ trong tài liệu đã đọc để trả lời."
+        report["citations"] = sorted(
+            {claim["doc_id"] for claim in retained if isinstance(claim.get("doc_id"), str)}
+        )
+        return report
