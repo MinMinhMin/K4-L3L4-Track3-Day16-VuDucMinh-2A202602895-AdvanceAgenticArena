@@ -1396,15 +1396,16 @@ def test_the_instructor_can_keep_the_prompts_without_putting_them_in_the_trace()
                                             warn_on_missing_final=False)).prompts
 
 
-def test_the_scored_prompt_addendum_is_off_by_default_and_reaches_the_model_when_on():
+def test_the_scored_prompt_addendum_is_automatic_for_non_mock_models():
     """Measured on a live endpoint: gpt-5.6-luna abstained on turn 1 with
     ZERO tool calls on 4 of 6 runs, which flattens the ladder. The
-    addendum compels a search first. Off by default so it cannot collide
-    with a prompt your own layers may want to set."""
+    addendum compels a search first. Non-mock models receive it by default;
+    the explicit runner option remains safe and does not append it twice."""
     plain = ScriptedModel('THOUGHT: x\nFINAL: {"abstain": true, "claims": []}')
     run_brief(BRIEF, model=plain, corpus=CORPUS, seed=11, config=QUIET)
     sent = plain.calls[0][0][0]["content"]
-    assert sent == ARENA_SYSTEM_PROMPT
+    assert sent.startswith(ARENA_SYSTEM_PROMPT)
+    assert "Lượt đầu tiên của bạn luôn luôn là một ACTION gọi search." in sent
 
     nudged = ScriptedModel('THOUGHT: x\nFINAL: {"abstain": true, "claims": []}')
     run_brief(
@@ -1413,7 +1414,8 @@ def test_the_scored_prompt_addendum_is_off_by_default_and_reaches_the_model_when
     )
     sent = nudged.calls[0][0][0]["content"]
     assert sent.startswith(ARENA_SYSTEM_PROMPT)
-    assert "search ít nhất một lần" in sent
+    assert "Bạn PHẢI gọi công cụ search ít nhất một lần" in sent
+    assert sent.count("QUY TẮC BỔ SUNG (bắt buộc):") == 1
 
 
 def test_the_runner_never_flags_an_honest_run_for_review():

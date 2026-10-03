@@ -8,10 +8,9 @@ cứng `False`, và nó bịa theo ba kiểu khác nhau:
   (c) HAI NGUỒN MÂU THUẪN -> ghép nửa câu của tài liệu này với nửa câu
       của tài liệu kia thành MỘT câu mà không tài liệu nào nói.
 
-TÍN HIỆU (chỉ một dòng): câu trong `claim["text"]` có xuất hiện NGUYÊN VĂN
-trong bằng chứng agent đã thực sự đọc hay không —
-
-    text in ctx.observed_text
+TÍN HIỆU: câu trong `claim["text"]` có được scorer chấp nhận như một
+đoạn trích trong MỘT DÒNG của tài liệu đã đọc hay không. So khớp dùng
+NFC, không phân biệt hoa thường, gộp khoảng trắng, giới hạn 12–500 ký tự.
 
 Trên một brief có bằng chứng tốt thì mọi claim đều thoả điều kiện này,
 nên critic xây trên tín hiệu đó không báo động giả.
@@ -44,9 +43,9 @@ kiện loại trừ nhau, đừng làm phần việc của lớp kia.
 GỢI Ý cho trường hợp (c): câu bị ghép là hai đoạn DO CHÍNH MÔ HÌNH viết,
 dán với nhau bằng một liên từ (" và "). Cắt đúng chỗ dán thì hai nửa vẫn
 là chữ của mô hình — vẫn qua được kiểm tra provenance. Muốn biết cắt đúng
-chưa: cả hai nửa phải xuất hiện nguyên văn trong `ctx.observed_text` và
-phải thuộc HAI tài liệu khác nhau. Cắt sai thì một nửa sẽ vắt qua hai tài
-liệu và không quan sát nào chứa nó.
+chưa: cả hai nửa phải được scorer hỗ trợ trong tài liệu đã đọc và phải
+thuộc HAI tài liệu khác nhau. Cắt sai thì một nửa sẽ vắt qua hai tài liệu
+và không tài liệu nào chứa nó như một dòng.
 
 CÔNG CỤ CÓ SẴN:
     ctx.observed_text  -> toàn bộ quan sát agent đã thấy, nối lại
@@ -70,7 +69,12 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+from harness.layers.citation_checker import MAX_CLAIM_CHARS, MIN_SUPPORT_CHARS, norm, source_of
 from harness.middleware import Middleware
+
+
+MAX_CLAIMS_PER_DOC = 4
+MAX_SCORED_CLAIMS = 10
 
 
 class Critic(Middleware):
@@ -85,24 +89,39 @@ class Critic(Middleware):
         if not isinstance(claims, list):
             return report
 
-        docs = getattr(ctx.corpus, "docs", ()) if ctx.corpus is not None else ()
-
         def sources_for(text):
-            if not text or not ctx.saw(text):
+            if not isinstance(text, str) or not text:
                 return []
-            for doc in docs:
-                if doc.body in ctx.observed_text and any(
-                    text in line for line in doc.body.splitlines()
-                ):
-                    yield doc.doc_id
+            if ctx.corpus is not None:
+                return source_of(text, ctx)
+            claim_length = len(norm(text))
+            return [""] if (
+                ctx.saw(text)
+                and MIN_SUPPORT_CHARS <= claim_length <= MAX_CLAIM_CHARS
+            ) else []
 
         retained = []
+        per_doc = {}
+
+        def keep(claim):
+            if len(retained) >= MAX_SCORED_CLAIMS:
+                return
+            doc_id = claim.get("doc_id")
+            if isinstance(doc_id, str):
+                count = per_doc.get(doc_id, 0)
+                if count >= MAX_CLAIMS_PER_DOC:
+                    return
+                per_doc[doc_id] = count + 1
+            retained.append(claim)
+
         for claim in claims:
             if not isinstance(claim, dict) or not isinstance(claim.get("text"), str):
                 continue
             text = claim["text"]
-            if ctx.saw(text):
-                retained.append(claim)
+            if not MIN_SUPPORT_CHARS <= len(norm(text)) <= MAX_CLAIM_CHARS:
+                continue
+            if sources_for(text):
+                keep(claim)
                 continue
             separator = " và "
             start = 0
@@ -121,10 +140,8 @@ class Critic(Middleware):
                 )
                 if split_sources is not None:
                     left_doc, right_doc = split_sources
-                    retained.extend(
-                        ({**claim, "text": left, "doc_id": left_doc},
-                         {**claim, "text": right, "doc_id": right_doc})
-                    )
+                    keep({**claim, "text": left, "doc_id": left_doc})
+                    keep({**claim, "text": right, "doc_id": right_doc})
                     report["abstain"] = True
                     break
                 start = split_at + len(separator)

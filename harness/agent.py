@@ -76,39 +76,39 @@ and the difference was measured on live keys:
 
 So this module ships `REAL_MODEL_PROMPT_ADDENDUM` and the prompt that
 carries it, `ARENA_SYSTEM_PROMPT_REAL`. Nothing in `arena/` is unfrozen:
-the addendum is appended by student-owned code and handed to the agent
-through the keyword argument that already existed.
+the addendum is appended by student-owned code for non-mock models.
 
-    ReActAgent(model, tools, trace, system_prompt=ARENA_SYSTEM_PROMPT_REAL)
+    ReActAgent(real_model, tools, trace)
 
-**THE SCORED, REAL-MODEL PATH MUST CONSTRUCT THE AGENT THAT WAY.**
+The constructor keeps the bare frozen `ARENA_SYSTEM_PROMPT` as its
+default so `MockModel` preserves the measured practice ladder. Real
+models receive the addendum automatically, including when wrapped by a
+runner adapter.
 
-The DEFAULT is still the bare frozen `ARENA_SYSTEM_PROMPT`, and that is a
-measured decision rather than caution. On `MockModel` the addendum is
+On `MockModel` the addendum is
 behaviourally NEUTRAL — grounding, safety and tool calls are
 byte-identical across all 30 trap-spanning runs — but `arena.model`
 estimates prompt tokens as `len(conversation) // 4`, so a 2,792-character
 addendum adds ~698 tokens to EVERY turn of a mock run and costs 1.28
 points of efficiency against the mock's 12,000-token budget (14.39 ->
 13.11), moving the practice ladder from 92.52 to 91.24. That is an
-artefact of the mock's estimator, not a real cost, and the practice
-ladder is a fixed acceptance artefact. Defaulting it off keeps the two
-paths honest: the mock ladder stays byte-identical, and the real path
-opts in explicitly.
+artefact of the mock's estimator, not a real cost. Keeping it off for
+mock models preserves that public acceptance artefact.
 
-The ~700 prompt tokens per call ARE a real cost on a real endpoint, and
-the scored round's per-brief `max_tokens` is sized with them included. If
-you switch the addendum on, measure your own efficiency delta with
-`scripts/run_practice.py --prompt-addendum` before assuming it is free.
+The ~700 prompt tokens per call are included in the scored round's
+per-brief `max_tokens` budget.
 """
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 
 from arena.model import (
     ARENA_SYSTEM_PROMPT,
+    MockModel,
+    RealModel,
     TOOL_ERROR_PREFIX,
     parse_output,
 )
@@ -152,6 +152,21 @@ REPORT_KEYS = ("answer", "claims", "abstain", "citations")
 #: appends an ACTION to every FINAL would otherwise never be allowed to
 #: finish. After this many deferrals the FINAL is taken at face value.
 MAX_FINAL_DEFERRALS = 2
+
+#: A real endpoint may stop before gathering evidence even when the brief
+#: has room for useful tool calls. Keep those refusals bounded so an
+#: endpoint that insists on finishing can still submit its best report.
+MAX_PREMATURE_REFUSALS = 2
+
+SEARCH_FIRST_NUDGE = (
+    "Chưa được trả lời FINAL trước khi tra cứu. Hãy dùng ACTION gọi công cụ "
+    "search với chính câu hỏi của đề bài, rồi đánh giá tài liệu tìm được."
+)
+READ_FIRST_NUDGE = (
+    "Chưa có trích dẫn nào được hỗ trợ bởi toàn văn tài liệu đã đọc. Hãy dùng "
+    "ACTION gọi fetch_doc để đọc tài liệu liên quan; nếu kết quả chưa đủ, "
+    "hãy tìm lại bằng thuật ngữ cụ thể trước khi kết luận."
+)
 
 #: What a model writes where CONTENT belongs when it is QUOTING the
 #: protocol instead of answering: the template's own `...`, an ellipsis,
@@ -273,6 +288,43 @@ def real_model_system_prompt(base: str = ARENA_SYSTEM_PROMPT) -> str:
 #: must pass as `system_prompt`; not the default (see the module
 #: docstring for the measured reason).
 ARENA_SYSTEM_PROMPT_REAL = real_model_system_prompt()
+
+
+def _is_mock_model(model) -> bool:
+    """Recognize MockModel through the small wrappers used by runners."""
+    current = model
+    for _ in range(5):
+        if isinstance(current, MockModel):
+            return True
+        inner = getattr(current, "inner", None)
+        if inner is None or inner is current:
+            break
+        current = inner
+    return isinstance(current, MockModel)
+
+
+def _is_real_model(model) -> bool:
+    """Recognize the configured live endpoint through runner adapters."""
+    current = model
+    for _ in range(5):
+        if isinstance(current, RealModel):
+            return True
+        inner = getattr(current, "inner", None)
+        if inner is None or inner is current:
+            break
+        current = inner
+    return isinstance(current, RealModel)
+
+
+def _effective_system_prompt(prompt: str, model) -> str:
+    """Add real-endpoint guidance automatically while keeping mock runs stable."""
+    if (
+        _is_mock_model(model)
+        or REAL_MODEL_PROMPT_ADDENDUM in prompt
+        or "QUY TẮC BỔ SUNG (bắt buộc):" in prompt
+    ):
+        return prompt
+    return real_model_system_prompt(prompt)
 
 #: `output_text` is clamped to this before it is stamped on `model_call`.
 #: `Trace.emit` truncates any record over 90,000 characters, and a
@@ -487,6 +539,7 @@ class ReActAgent:
         # belongs to the layers.
         self._final_deferrals = 0
         self._refused_final: dict | None = None
+        self._premature_final_refusals = 0
 
     # -- the run -------------------------------------------------------
 
@@ -503,11 +556,12 @@ class ReActAgent:
         self.last_context = ctx
         self._final_deferrals = 0
         self._refused_final = None
+        self._premature_final_refusals = 0
 
         self.trace.emit("agent_start", brief_id=str(brief.get("brief_id", "")))
 
         ctx.messages = [
-            {"role": "system", "content": self.system_prompt},
+            {"role": "system", "content": _effective_system_prompt(self.system_prompt, self.model)},
             {"role": "user", "content": ctx.question},
         ]
         self.middleware.before_agent(ctx)
@@ -532,6 +586,12 @@ class ReActAgent:
             ctx.messages.append({"role": "assistant", "content": text})
 
             if parsed.kind == "final":
+                final = parsed.final if isinstance(parsed.final, dict) else {}
+                nudge = self._premature_nudge(ctx, final)
+                if nudge is not None:
+                    self._refused_final = final
+                    ctx.messages.append({"role": "user", "content": nudge})
+                    continue
                 report = parsed.final if isinstance(parsed.final, dict) else {}
                 ctx.stop_reason = "final"
                 break
@@ -558,6 +618,51 @@ class ReActAgent:
         # runner stamps its own `agent_end` with the timing it measured.
         self.trace.emit("agent_end", stop_reason=ctx.stop_reason, steps=ctx.step + 1)
         return report
+
+    def _premature_nudge(self, ctx: AgentContext, final: dict) -> str | None:
+        """Ask a real model to gather evidence before an empty or unsupported FINAL.
+
+        The budget includes the automatic submit call. A search nudge needs
+        one useful call remaining; a read nudge also needs one. Missing
+        budgets are treated as unlimited. Only the configured RealModel
+        path receives nudges, so scripted adapters and the public mock
+        ladder retain their existing behavior.
+        """
+        if not _is_real_model(self.model):
+            return None
+        if self._premature_final_refusals >= MAX_PREMATURE_REFUSALS:
+            return None
+
+        limit = ctx.max_tool_calls
+        calls = getattr(ctx.tools, "calls", 0)
+        try:
+            calls = max(0, int(calls))
+        except (TypeError, ValueError):
+            calls = 0
+        useful_calls_left = None if limit is None else max(0, int(limit) - 1 - calls)
+
+        if not ctx.observations:
+            if useful_calls_left is not None and useful_calls_left < 1:
+                return None
+            self._premature_final_refusals += 1
+            return SEARCH_FIRST_NUDGE
+
+        claims = final.get("claims") if isinstance(final, dict) else None
+        from harness.layers.citation_checker import source_of
+
+        has_grounded_claim = isinstance(claims, list) and any(
+            isinstance(claim, dict)
+            and isinstance(claim.get("text"), str)
+            and source_of(claim["text"], ctx)
+            for claim in claims
+        )
+        if has_grounded_claim:
+            return None
+        if useful_calls_left is not None and useful_calls_left < 1:
+            return None
+
+        self._premature_final_refusals += 1
+        return READ_FIRST_NUDGE
 
     # -- reading the model ---------------------------------------------
 
@@ -659,7 +764,38 @@ class ReActAgent:
         result = call(parsed.tool, dict(parsed.args))
         if result is None or not hasattr(result, "ok"):
             return f"{TOOL_ERROR_PREFIX} layer trả về kết quả không hợp lệ cho {parsed.tool}"
+        if result.ok and isinstance(getattr(result, "content", None), str):
+            self._record_observed_doc_ids(ctx, parsed.tool, parsed.args, result.content)
         return result.content if result.ok else f"{TOOL_ERROR_PREFIX} {result.error}"
+
+    @staticmethod
+    def _record_observed_doc_ids(ctx: AgentContext, name: str, args: dict, content: str) -> None:
+        """Remember which document IDs survived the tool middleware."""
+        observed_ids = ctx.state.get("observed_doc_ids")
+        if not isinstance(observed_ids, set):
+            observed_ids = {
+                item for item in observed_ids
+                if isinstance(item, str)
+            } if isinstance(observed_ids, (list, tuple, set, frozenset)) else set()
+            ctx.state["observed_doc_ids"] = observed_ids
+
+        if name == "fetch_doc":
+            doc_id = _as_text(args.get("doc_id"))
+            if doc_id:
+                observed_ids.add(doc_id)
+            return
+        if name != "search":
+            return
+        try:
+            results = json.loads(content)
+        except (TypeError, ValueError):
+            return
+        if isinstance(results, list):
+            observed_ids.update(
+                item["doc_id"]
+                for item in results
+                if isinstance(item, dict) and isinstance(item.get("doc_id"), str)
+            )
 
     def _dispatch(self, name: str, args: dict) -> ToolResult:
         """The innermost tool call — what `wrap_tool_call` wraps."""

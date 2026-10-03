@@ -8,13 +8,14 @@ vì báo cáo đọc vào vẫn rất thuyết phục.
 
 TÍN HIỆU (chính xác, không cần đoán):
 
-    claim["text"] KHÔNG khớp NGUYÊN VĂN một DÒNG nào trong
+    claim["text"] KHÔNG khớp theo chuẩn hoá của scorer với một DÒNG nào trong
     corpus.get(claim["doc_id"]).body
     nhưng CHÍNH câu đó CÓ trong bằng chứng agent đã quan sát
 
 Chú ý chữ DÒNG: kiểm tra `claim["text"] in doc.body` (cả khối, không
-tách dòng) là SAI — scorer chỉ nhận trích dẫn khớp nguyên văn MỘT DÒNG
-(xem "ĐƯỢC PHÉP VÀ KHÔNG ĐƯỢC PHÉP" ngay dưới đây). `in doc.body` coi
+tách dòng) là SAI — scorer chỉ nhận trích dẫn khớp MỘT DÒNG sau khi
+chuẩn hoá NFC, hoa thường và khoảng trắng (xem "ĐƯỢC PHÉP VÀ KHÔNG ĐƯỢC
+PHÉP" ngay dưới đây). `in doc.body` coi
 một câu vắt qua hai dòng là hợp lệ, trong khi scorer thì không — tín
 hiệu kiểu đó khiến bạn giữ nguyên một trích dẫn mà scorer vẫn chấm
 `HALLUCINATED`.
@@ -26,17 +27,17 @@ Hai điều kiện loại trừ nhau nên hai lớp không giành điểm của 
 
 ĐƯỢC PHÉP VÀ KHÔNG ĐƯỢC PHÉP:
   * ĐƯỢC: đổi `claim["doc_id"]`, cập nhật `report["citations"]`.
-  * KHÔNG: sửa `claim["text"]`. Scorer chỉ cho điểm khi câu là trích dẫn
-    nguyên văn của MỘT DÒNG trong tài liệu được trích VÀ đúng là chữ mô
-    hình đã viết. Thêm dấu chấm, đổi dấu nháy, "chuẩn hoá" khoảng trắng,
-    hay vá lại câu bị cắt bằng nội dung lấy từ corpus đều làm mất cả hai
-    điều kiện cùng lúc (đo được: -40 điểm).
+  * KHÔNG: sửa `claim["text"]`. Scorer chỉ cho điểm khi câu khớp một
+    DÒNG trong tài liệu được trích sau khi chuẩn hoá, VÀ đúng là chữ mô
+    hình đã viết. Thêm dấu chấm, đổi từ, hay vá lại câu bị cắt bằng nội
+    dung lấy từ corpus đều làm mất cả hai điều kiện cùng lúc.
 
 CHỈ ĐƯỢC GẮN VÀO TÀI LIỆU ĐÃ QUAN SÁT. Trích một tài liệu mà lượt chạy
 chưa từng đọc bị chấm `UNRETRIEVED`. Vì vậy hãy tìm nguồn trong
-`ctx.observed_text`, đừng quét cả corpus rồi gắn bừa: điều kiện
-`doc.body in ctx.observed_text` nghĩa là "tài liệu này đã về nguyên vẹn
-từ một lần fetch sạch" — một đoạn snippet hay một bản bị cắt không tính.
+`ctx.observed_text`, đừng quét cả corpus rồi gắn bừa. Lớp ghi nhận ID từ
+kết quả công cụ đã qua middleware, rồi xác nhận nguyên câu trích vẫn còn
+trong phần mô hình đã thấy; cách này cũng giữ được câu sạch khi
+`InjectionGuard` gỡ một khối khỏi tài liệu.
 
 CÔNG CỤ CÓ SẴN:
     ctx.observed_text  -> toàn bộ quan sát agent đã thấy, nối lại
@@ -59,7 +60,75 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+import re
+import unicodedata
+
 from harness.middleware import Middleware
+
+
+_WHITESPACE = re.compile(r"\s+")
+MIN_SUPPORT_CHARS = 12
+MAX_CLAIM_CHARS = 500
+
+
+def norm(text: str) -> str:
+    """Match the scorer's NFC, case-folded, collapsed-whitespace form."""
+    if not isinstance(text, str):
+        text = "" if text is None else str(text)
+    return _WHITESPACE.sub(" ", unicodedata.normalize("NFC", text).casefold()).strip()
+
+
+def quoted_in(text: str, doc) -> bool:
+    """Whether a claim is a scorer-valid quote from one line of ``doc``."""
+    claim = norm(text)
+    if not MIN_SUPPORT_CHARS <= len(claim) <= MAX_CLAIM_CHARS:
+        return False
+    body = getattr(doc, "body", "")
+    return any(claim in norm(line) for line in body.splitlines())
+
+
+def _quote_was_observed(text: str, ctx) -> bool:
+    claim = norm(text)
+    if not claim:
+        return False
+    return any(
+        claim in norm(line)
+        for observation in ctx.observations
+        if isinstance(observation, str)
+        for line in observation.splitlines()
+    )
+
+
+def source_of(text: str, ctx) -> list[str]:
+    """Find observed documents that support ``text`` as one scorer-valid line.
+
+    A fetched document can be shortened by a tool layer such as
+    ``InjectionGuard``. In that case the document ID proves which source
+    was read, while the observation check below proves the quoted line
+    itself remained visible to the model.
+    """
+    corpus = getattr(ctx, "corpus", None)
+    if corpus is None or not MIN_SUPPORT_CHARS <= len(norm(text)) <= MAX_CLAIM_CHARS:
+        return []
+    observed = ctx.observed_text
+    observed_ids = getattr(ctx, "state", {}).get("observed_doc_ids", set())
+    if not isinstance(observed_ids, (set, frozenset, list, tuple)):
+        observed_ids = set()
+    observed_ids = set(observed_ids)
+    observed_quote = _quote_was_observed(text, ctx)
+    if not observed_quote:
+        return []
+    sources = []
+    for doc in corpus.docs:
+        if observed_ids:
+            was_observed = doc.doc_id in observed_ids
+        else:
+            was_observed = (
+                isinstance(getattr(doc, "body", None), str) and doc.body in observed
+            )
+        if was_observed and quoted_in(text, doc):
+            sources.append(doc.doc_id)
+    return sources
 
 
 class CitationChecker(Middleware):
@@ -72,9 +141,6 @@ class CitationChecker(Middleware):
         if not isinstance(claims, list) or not claims or ctx.corpus is None:
             return report
 
-        def matches_line(doc, text):
-            return bool(text) and any(text in line for line in doc.body.splitlines())
-
         for claim in claims:
             if not isinstance(claim, dict) or not isinstance(claim.get("text"), str):
                 continue
@@ -84,13 +150,12 @@ class CitationChecker(Middleware):
             if (
                 current is not None
                 and current.body in ctx.observed_text
-                and matches_line(current, text)
+                and quoted_in(text, current)
             ):
                 continue
-            for candidate in ctx.corpus.docs:
-                if candidate.body in ctx.observed_text and matches_line(candidate, text):
-                    claim["doc_id"] = candidate.doc_id
-                    break
+            sources = source_of(text, ctx)
+            if sources:
+                claim["doc_id"] = sources[0]
         report["citations"] = sorted(
             {claim["doc_id"] for claim in claims
              if isinstance(claim, dict) and isinstance(claim.get("doc_id"), str)}
